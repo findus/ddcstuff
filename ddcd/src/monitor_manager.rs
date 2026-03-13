@@ -31,7 +31,8 @@ impl MonitorManager {
 
     /// Scan for all monitors. Replaces the current cache.
     /// This is slow (I2C enumeration) and should not be called on every brightness change.
-    pub fn scan(&mut self) {
+    /// Scan for all monitors. Returns the number of DDC monitors found.
+    pub fn scan(&mut self) -> usize {
         info!("scanning monitors...");
 
         // Enumerate DDC/CI monitors
@@ -62,6 +63,8 @@ impl MonitorManager {
             self.ddc_monitors.len(),
             if self.backlight.is_some() { "1" } else { "0" }
         );
+
+        self.ddc_monitors.len()
     }
 
     /// Set brightness on a specific monitor by ID (used by the fade controller).

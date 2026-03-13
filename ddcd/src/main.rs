@@ -128,18 +128,30 @@ async fn main() -> Result<()> {
         });
     });
 
-    // Spawn rescan handler
+    // Spawn rescan handler with retry-on-empty backoff.
+    // When the dock is plugged in, udev fires before I2C buses are ready.
+    // If scan() finds 0 DDC monitors, retry up to 5 times (2s, 4s, 8s, 16s, 16s).
     let manager_for_rescan = Arc::clone(&manager);
     tokio::spawn(async move {
         while let Some(reason) = rescan_rx.recv().await {
             info!("rescanning monitors (reason: {:?})", reason);
-            let mgr = Arc::clone(&manager_for_rescan);
-            if let Err(e) = tokio::task::spawn_blocking(move || {
-                mgr.blocking_lock().scan();
-            })
-            .await
-            {
-                error!("rescan error: {e}");
+
+            const MAX_ATTEMPTS: u32 = 5;
+            for attempt in 0..MAX_ATTEMPTS {
+                let mgr = Arc::clone(&manager_for_rescan);
+                let found = match tokio::task::spawn_blocking(move || mgr.blocking_lock().scan()).await {
+                    Ok(n) => n,
+                    Err(e) => { error!("rescan error: {e}"); break; }
+                };
+
+                if found > 0 || attempt + 1 == MAX_ATTEMPTS {
+                    break;
+                }
+
+                // I2C buses not ready yet — wait and retry with exponential backoff.
+                let delay_secs = 1u64 << (attempt + 1).min(4); // 2, 4, 8, 16, 16...
+                info!("no DDC monitors found, retrying in {delay_secs}s (attempt {}/{MAX_ATTEMPTS})", attempt + 1);
+                tokio::time::sleep(tokio::time::Duration::from_secs(delay_secs)).await;
             }
         }
     });

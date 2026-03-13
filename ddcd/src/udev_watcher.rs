@@ -36,7 +36,7 @@ pub async fn run_udev_watcher(trigger: mpsc::Sender<RescanReason>) -> anyhow::Re
             }
             // Drain any additional signals that arrive within the debounce window
             loop {
-                match tokio::time::timeout(Duration::from_millis(500), debounce_rx.recv()).await {
+                match tokio::time::timeout(Duration::from_millis(1500), debounce_rx.recv()).await {
                     Ok(Some(())) => {} // another event, keep waiting
                     _ => break,       // timeout or channel closed
                 }
