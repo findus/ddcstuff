@@ -20,7 +20,7 @@ clap               = { workspace = true }
 futures            = "0.3"
 
 # DDC/CI — enumerates /dev/i2c-* automatically on Linux
-ddc-hi = { version = "0.4.1", features = ["ddc-i2c"] }
+ddc-hi  = { version = "0.4.1", features = ["ddc-i2c"] }
 
 # udev hotplug
 tokio-udev = "0.10.0"

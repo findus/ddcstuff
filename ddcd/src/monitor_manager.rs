@@ -29,41 +29,24 @@ impl MonitorManager {
         }
     }
 
-    /// Scan for all monitors. Replaces the current cache.
-    /// This is slow (I2C enumeration) and should not be called on every brightness change.
-    /// Scan for all monitors. Returns the number of DDC monitors found.
-    pub fn scan(&mut self) -> usize {
-        info!("scanning monitors...");
+    /// Return the config Arc so the caller can run a scan without holding the manager lock.
+    pub fn config(&self) -> Arc<Config> {
+        Arc::clone(&self.config)
+    }
 
-        // Enumerate DDC/CI monitors
-        let displays = Display::enumerate();
-        let mut new_ddc: Vec<DdcMonitor> = Vec::new();
-        for display in displays {
-            let raw_id = display.info.id.clone();
-            match DdcMonitor::from_display(display) {
-                Ok(m) => {
-                    info!("found DDC monitor: {} ({})", m.name, m.id);
-                    new_ddc.push(m);
-                }
-                Err(e) => {
-                    tracing::debug!("skipping display {raw_id}: {e}");
-                }
-            }
-        }
-        self.ddc_monitors = new_ddc;
-
-        // Detect backlight
-        self.backlight = Backlight::detect(&self.config.backlight.path);
+    /// Store the results of a completed scan. Call this after `run_scan()` finishes.
+    /// Only holds `&mut self` for a brief moment to swap in the new data.
+    pub fn apply_scan_results(&mut self, monitors: Vec<DdcMonitor>, backlight: Option<Backlight>) -> usize {
+        self.ddc_monitors = monitors;
+        self.backlight = backlight;
         if let Some(bl) = &self.backlight {
             info!("found backlight: {} ({})", bl.name, bl.id);
         }
-
         info!(
             "scan complete: {} DDC monitor(s), {} backlight",
             self.ddc_monitors.len(),
             if self.backlight.is_some() { "1" } else { "0" }
         );
-
         self.ddc_monitors.len()
     }
 
@@ -214,6 +197,22 @@ impl MonitorManager {
     fn find_ddc(&self, id: &MonitorId) -> Option<&DdcMonitor> {
         self.ddc_monitors.iter().find(|m| &m.id == id)
     }
+}
+
+/// Do all the slow I/O (DDC enumeration, backlight detection) without holding any lock.
+/// Returns the discovered monitors and backlight; call `apply_scan_results` to store them.
+pub fn run_scan(config: &Config) -> (Vec<DdcMonitor>, Option<Backlight>) {
+    info!("scanning monitors...");
+    let mut monitors: Vec<DdcMonitor> = Vec::new();
+    for display in Display::enumerate() {
+        let raw_id = display.info.id.clone();
+        match DdcMonitor::from_display(display) {
+            Ok(m) => { info!("found DDC monitor: {} ({})", m.name, m.id); monitors.push(m); }
+            Err(e) => { tracing::debug!("skipping display {raw_id}: {e}"); }
+        }
+    }
+    let backlight = Backlight::detect(&config.backlight.path);
+    (monitors, backlight)
 }
 
 pub fn apply_op(op: &BrightnessOp, current: u8) -> u8 {

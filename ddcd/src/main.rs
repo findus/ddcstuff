@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use ddc_lib::ipc::default_socket_path;
 use fade::FadeController;
+use monitor_manager::run_scan;
 use monitor_manager::MonitorManager;
 use tokio::net::UnixListener;
 use tokio::sync::{watch, Mutex};
@@ -109,8 +110,8 @@ async fn main() -> Result<()> {
     });
 
     // Rescan handler: retries until the DDC monitor count stabilises.
-    // Keeps scanning as long as each attempt finds more monitors than the last
-    // (handles docks that register I2C buses sequentially after plug-in).
+    // run_scan() does all the slow I/O WITHOUT holding the manager lock, so
+    // brightness commands are never blocked while a scan is in progress.
     let manager_for_rescan = Arc::clone(&manager);
     tokio::spawn(async move {
         while let Some(reason) = rescan_rx.recv().await {
@@ -119,11 +120,17 @@ async fn main() -> Result<()> {
             let mut last_found = 0usize;
             const MAX_ATTEMPTS: u32 = 6;
             for attempt in 0..MAX_ATTEMPTS {
-                let mgr = Arc::clone(&manager_for_rescan);
-                let found = match tokio::task::spawn_blocking(move || mgr.blocking_lock().scan()).await {
-                    Ok(n) => n,
+                // Grab config without holding the lock for the scan itself.
+                let config = manager_for_rescan.lock().await.config();
+
+                // Heavy I/O: no lock held.
+                let (monitors, backlight) = match tokio::task::spawn_blocking(move || run_scan(&config)).await {
+                    Ok(r) => r,
                     Err(e) => { error!("rescan error: {e}"); break; }
                 };
+
+                // Brief lock: just swap in the new results.
+                let found = manager_for_rescan.lock().await.apply_scan_results(monitors, backlight);
 
                 if attempt + 1 == MAX_ATTEMPTS { break; }
 

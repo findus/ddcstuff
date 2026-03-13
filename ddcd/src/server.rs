@@ -14,7 +14,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     config::Config,
     fade::FadeController,
-    monitor_manager::{apply_op, MonitorManager},
+    monitor_manager::{apply_op, run_scan, MonitorManager},
 };
 
 pub async fn run_server(
@@ -75,16 +75,14 @@ async fn dispatch(
         },
 
         Request::Rescan => {
-            let manager = Arc::clone(&manager);
-            let result = tokio::task::spawn_blocking(move || {
-                manager.blocking_lock().scan();
-            })
-            .await;
+            let config = manager.lock().await.config();
+            let result = tokio::task::spawn_blocking(move || run_scan(&config)).await;
             match result {
-                Ok(_) => Response::Ok,
-                Err(e) => Response::Error {
-                    message: e.to_string(),
-                },
+                Ok((monitors, backlight)) => {
+                    manager.lock().await.apply_scan_results(monitors, backlight);
+                    Response::Ok
+                }
+                Err(e) => Response::Error { message: e.to_string() },
             }
         }
 
