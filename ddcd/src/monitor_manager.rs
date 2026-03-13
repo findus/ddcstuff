@@ -171,7 +171,7 @@ impl MonitorManager {
         }
     }
 
-    fn all_ids(&self) -> Vec<MonitorId> {
+    pub fn all_ids(&self) -> Vec<MonitorId> {
         let mut ids: Vec<MonitorId> = self.ddc_monitors.iter().map(|m| m.id.clone()).collect();
         if let Some(bl) = &self.backlight {
             ids.push(bl.id.clone());

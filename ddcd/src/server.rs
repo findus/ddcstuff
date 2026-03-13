@@ -5,7 +5,10 @@ use ddc_lib::{
     ipc::{read_message, write_message},
     protocol::{Request, Response, Target},
 };
-use tokio::{net::UnixListener, sync::Mutex};
+use tokio::{
+    net::UnixListener,
+    sync::{watch, Mutex},
+};
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -19,6 +22,7 @@ pub async fn run_server(
     manager: Arc<Mutex<MonitorManager>>,
     fade: Arc<Mutex<FadeController>>,
     config: Arc<Config>,
+    desired_tx: Arc<watch::Sender<u8>>,
 ) -> Result<()> {
     info!("listening for connections");
     loop {
@@ -27,8 +31,9 @@ pub async fn run_server(
                 let manager = Arc::clone(&manager);
                 let fade = Arc::clone(&fade);
                 let config = Arc::clone(&config);
+                let desired_tx = Arc::clone(&desired_tx);
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, manager, fade, config).await {
+                    if let Err(e) = handle_connection(stream, manager, fade, config, desired_tx).await {
                         warn!("connection error: {e}");
                     }
                 });
@@ -45,13 +50,14 @@ async fn handle_connection(
     manager: Arc<Mutex<MonitorManager>>,
     fade: Arc<Mutex<FadeController>>,
     config: Arc<Config>,
+    desired_tx: Arc<watch::Sender<u8>>,
 ) -> Result<()> {
     let (mut reader, mut writer) = stream.into_split();
 
     let request: Request = read_message(&mut reader).await?;
     debug!("request: {:?}", request);
 
-    let response = dispatch(request, manager, fade, config).await;
+    let response = dispatch(request, manager, fade, config, desired_tx).await;
     write_message(&mut writer, &response).await?;
     Ok(())
 }
@@ -61,6 +67,7 @@ async fn dispatch(
     manager: Arc<Mutex<MonitorManager>>,
     fade: Arc<Mutex<FadeController>>,
     config: Arc<Config>,
+    desired_tx: Arc<watch::Sender<u8>>,
 ) -> Response {
     match request {
         Request::Ping => Response::Pong {
@@ -151,23 +158,21 @@ async fn dispatch(
                     );
                 }
                 Response::Ok
+            } else if matches!(target, Target::All) {
+                // Coalesced fast path for "all monitors": update the desired brightness
+                // watch and return immediately. The applier task writes the latest value,
+                // dropping any intermediates that piled up during rapid scroll events.
+                let current = *desired_tx.borrow();
+                let new_val = apply_op(&op, current);
+                let _ = desired_tx.send(new_val);
+                Response::Ok
             } else {
-                // Fast path: direct blocking write, all monitors concurrently
+                // Single-monitor path: blocking write, used infrequently.
                 let manager_clone = Arc::clone(&manager);
                 let result = tokio::task::spawn_blocking(move || {
                     let mut mgr = manager_clone.blocking_lock();
                     match &target {
-                        Target::All => {
-                            let results = mgr.apply_to_all(&op);
-                            let mut statuses = Vec::new();
-                            for result in results {
-                                match result {
-                                    Ok(s) => statuses.push(s),
-                                    Err(e) => warn!("set brightness failed for a monitor: {e}"),
-                                }
-                            }
-                            Ok(statuses)
-                        }
+                        Target::All => unreachable!(),
                         Target::ById { id } => {
                             mgr.apply_to_monitor(id, &op).map(|s| vec![s])
                         }
@@ -185,12 +190,8 @@ async fn dispatch(
 
                 match result {
                     Ok(Ok(monitors)) => Response::Brightness { monitors },
-                    Ok(Err(e)) => Response::Error {
-                        message: e.to_string(),
-                    },
-                    Err(e) => Response::Error {
-                        message: e.to_string(),
-                    },
+                    Ok(Err(e)) => Response::Error { message: e.to_string() },
+                    Err(e) => Response::Error { message: e.to_string() },
                 }
             }
         }
