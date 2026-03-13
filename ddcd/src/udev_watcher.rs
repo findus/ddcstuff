@@ -7,8 +7,8 @@ use tracing::{debug, info, warn};
 
 #[derive(Debug)]
 pub enum RescanReason {
+    Startup,
     UdevDrm,
-
 }
 
 /// Watch for DRM hotplug events and send rescan triggers with debouncing.

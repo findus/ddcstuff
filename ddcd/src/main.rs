@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use ddc_lib::ipc::default_socket_path;
 use fade::FadeController;
+use monitor_manager::run_scan;
 use monitor_manager::MonitorManager;
 use tokio::net::UnixListener;
 use tokio::sync::{watch, Mutex};
@@ -67,41 +68,21 @@ async fn main() -> Result<()> {
 
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("bind socket {}", socket_path.display()))?;
+    // Allow any user to connect (brightness control is not a security boundary).
+    std::fs::set_permissions(&socket_path, std::os::unix::fs::PermissionsExt::from_mode(0o666))
+        .with_context(|| format!("chmod socket {}", socket_path.display()))?;
     info!("socket: {}", socket_path.display());
 
-    // Initial monitor scan (blocking, before entering async loop)
-    let manager = {
-        let mut mgr = MonitorManager::new(Arc::clone(&config));
-        // Run the scan in a blocking thread so we don't block tokio
-        let mgr = tokio::task::spawn_blocking(move || {
-            mgr.scan();
-            mgr
-        })
-        .await?;
-        Arc::new(Mutex::new(mgr))
-    };
+    // Manager starts empty — the initial scan runs in the background so the server
+    // is immediately available (backlight control works as soon as the first scan
+    // finishes, without waiting for DDC retries to complete).
+    let manager = Arc::new(Mutex::new(MonitorManager::new(Arc::clone(&config))));
 
     let fade = Arc::new(Mutex::new(FadeController::new()));
 
-    // Watch channel for coalesced "set all monitors" brightness.
-    // Each SetBrightness{All} request just updates this value; a single applier
-    // task drains it as fast as DDC allows. Rapid scroll events are coalesced so
-    // only the latest pending value is written — no queue buildup.
-    let initial_brightness = {
-        let mgr = manager.lock().await;
-        let ids = mgr.all_ids();
-        if ids.is_empty() {
-            50u8
-        } else {
-            let sum: u32 = mgr
-                .list_monitors()
-                .iter()
-                .map(|m| m.brightness_percent as u32)
-                .sum();
-            (sum / ids.len() as u32).clamp(1, 100) as u8
-        }
-    };
-    let (desired_tx, desired_rx) = watch::channel(initial_brightness);
+    // Watch channel for coalesced "set all monitors" brightness (starts at 50;
+    // updated to the actual value after the first scan completes).
+    let (desired_tx, desired_rx) = watch::channel(50u8);
     let desired_tx = Arc::new(desired_tx);
 
     // Applier: always writes the latest desired brightness; never queues stale values.
@@ -128,35 +109,48 @@ async fn main() -> Result<()> {
         });
     });
 
-    // Spawn rescan handler with retry-on-empty backoff.
-    // When the dock is plugged in, udev fires before I2C buses are ready.
-    // If scan() finds 0 DDC monitors, retry up to 5 times (2s, 4s, 8s, 16s, 16s).
+    // Rescan handler: retries until the DDC monitor count stabilises.
+    // run_scan() does all the slow I/O WITHOUT holding the manager lock, so
+    // brightness commands are never blocked while a scan is in progress.
     let manager_for_rescan = Arc::clone(&manager);
     tokio::spawn(async move {
         while let Some(reason) = rescan_rx.recv().await {
             info!("rescanning monitors (reason: {:?})", reason);
 
-            const MAX_ATTEMPTS: u32 = 5;
+            let mut last_found = 0usize;
+            const MAX_ATTEMPTS: u32 = 6;
             for attempt in 0..MAX_ATTEMPTS {
-                let mgr = Arc::clone(&manager_for_rescan);
-                let found = match tokio::task::spawn_blocking(move || mgr.blocking_lock().scan()).await {
-                    Ok(n) => n,
+                // Grab config without holding the lock for the scan itself.
+                let config = manager_for_rescan.lock().await.config();
+
+                // Heavy I/O: no lock held.
+                let (monitors, backlight) = match tokio::task::spawn_blocking(move || run_scan(&config)).await {
+                    Ok(r) => r,
                     Err(e) => { error!("rescan error: {e}"); break; }
                 };
 
-                if found > 0 || attempt + 1 == MAX_ATTEMPTS {
-                    break;
-                }
+                // Brief lock: just swap in the new results.
+                let found = manager_for_rescan.lock().await.apply_scan_results(monitors, backlight);
 
-                // I2C buses not ready yet — wait and retry with exponential backoff.
-                let delay_secs = 1u64 << (attempt + 1).min(4); // 2, 4, 8, 16, 16...
-                info!("no DDC monitors found, retrying in {delay_secs}s (attempt {}/{MAX_ATTEMPTS})", attempt + 1);
-                tokio::time::sleep(tokio::time::Duration::from_secs(delay_secs)).await;
+                if attempt + 1 == MAX_ATTEMPTS { break; }
+
+                if found > last_found {
+                    last_found = found;
+                    info!("found {found} DDC monitor(s), rescanning in 2s to check for more...");
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                } else if found == 0 {
+                    let delay = 1u64 << (attempt + 1).min(4);
+                    info!("no DDC monitors found, retrying in {delay}s (attempt {}/{MAX_ATTEMPTS})", attempt + 1);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
+                } else {
+                    break; // found > 0 and stable
+                }
             }
         }
     });
 
-    // Spawn Unix socket server
+    // Spawn Unix socket server — starts before the initial scan so backlight
+    // commands are accepted immediately (DDC retries happen in background).
     let server_manager = Arc::clone(&manager);
     let server_fade = Arc::clone(&fade);
     let server_config = Arc::clone(&config);
@@ -166,6 +160,9 @@ async fn main() -> Result<()> {
             error!("server error: {e}");
         }
     });
+
+    // Trigger initial scan through the same retry loop used for hotplug rescans.
+    let _ = rescan_tx.send(RescanReason::Startup).await;
 
     // Wait for SIGTERM or SIGINT
     tokio::select! {

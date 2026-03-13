@@ -128,3 +128,25 @@ path = ""          # default: auto-detect; override e.g. "/sys/class/backlight/i
 When connecting a Thunderbolt dock, the daemon detects the hotplug via udev and rescans. If the I2C buses are not yet ready (common with Thunderbolt), it retries up to 5 times with exponential backoff (2 s, 4 s, 8 s, 16 s, 16 s) before giving up.
 
 If monitors are not detected after docking, run `ddcctl rescan` to trigger a manual rescan.
+
+## Nixos Usage Example
+
+```nix
+# flake.nix
+inputs = {
+  ddcstuff.url = "github:findus/ddcstuff";
+};
+
+outputs = { nixpkgs, ddcstuff, ... }: {
+  nixosConfigurations.yourhostname = nixpkgs.lib.nixosSystem {
+    modules = [
+      ddcstuff.nixosModules.default          # brings in the service option
+      {
+        nixpkgs.overlays = [ ddcstuff.overlays.default ];  # brings in pkgs.ddcstuff
+        services.ddcstuff.enable = true;
+        users.users.findus.extraGroups = [ "i2c" "video" ];
+      }
+    ];
+  };
+};
+```
