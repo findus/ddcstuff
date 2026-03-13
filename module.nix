@@ -24,6 +24,7 @@ in {
 
     # Run ddcd as a systemd user service that starts with the graphical session.
     systemd.user.services.ddcd = {
+      enable = true;
       description = "DDC brightness daemon";
       partOf = [ "graphical-session.target" ];
       wantedBy = [ "graphical-session.target" ];
