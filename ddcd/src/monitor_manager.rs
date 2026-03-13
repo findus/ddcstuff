@@ -214,9 +214,10 @@ impl MonitorManager {
 }
 
 pub fn apply_op(op: &BrightnessOp, current: u8) -> u8 {
-    match op {
-        BrightnessOp::Set { percent } => (*percent).min(100),
-        BrightnessOp::Increase { percent } => current.saturating_add(*percent).min(100),
+    let value = match op {
+        BrightnessOp::Set { percent } => *percent,
+        BrightnessOp::Increase { percent } => current.saturating_add(*percent),
         BrightnessOp::Decrease { percent } => current.saturating_sub(*percent),
-    }
+    };
+    value.clamp(1, 100)
 }
