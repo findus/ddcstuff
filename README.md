@@ -132,15 +132,21 @@ If monitors are not detected after docking, run `ddcctl rescan` to trigger a man
 ## Nixos Usage Example
 
 ```nix
-# flake.nix inputs
-inputs.ddcstuff.url = "path:/home/findus/repos/ddc";  # or a git URL later
+# flake.nix
+inputs = {
+  ddcstuff.url = "github:findus/ddcstuff";
+};
 
-# nixosConfigurations
-nixpkgs.overlays = [
-  (import /home/findus/repos/ddc/overlay.nix)
-  # or if using flake input:
-  # ddcstuff.overlays.default
-];
-
-environment.systemPackages = [ pkgs.ddcstuff ];
+outputs = { nixpkgs, ddcstuff, ... }: {
+  nixosConfigurations.yourhostname = nixpkgs.lib.nixosSystem {
+    modules = [
+      ddcstuff.nixosModules.default          # brings in the service option
+      {
+        nixpkgs.overlays = [ ddcstuff.overlays.default ];  # brings in pkgs.ddcstuff
+        services.ddcstuff.enable = true;
+        users.users.findus.extraGroups = [ "i2c" "video" ];
+      }
+    ];
+  };
+};
 ```
