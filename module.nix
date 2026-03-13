@@ -14,6 +14,9 @@ in {
   };
 
   config = lib.mkIf cfg.enable {
+    # Make ddcctl available to all users.
+    environment.systemPackages = [ cfg.package ];
+
     # Ensure the i2c group exists for DDC/CI access.
     users.groups.i2c = {};
 
