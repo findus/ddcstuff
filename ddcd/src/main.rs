@@ -67,6 +67,9 @@ async fn main() -> Result<()> {
 
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("bind socket {}", socket_path.display()))?;
+    // Allow any user to connect (brightness control is not a security boundary).
+    std::fs::set_permissions(&socket_path, std::os::unix::fs::PermissionsExt::from_mode(0o666))
+        .with_context(|| format!("chmod socket {}", socket_path.display()))?;
     info!("socket: {}", socket_path.display());
 
     // Initial monitor scan (blocking, before entering async loop)

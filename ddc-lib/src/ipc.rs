@@ -45,11 +45,29 @@ where
 }
 
 /// Default socket path.
+///
+/// When the daemon runs as root (system service) the socket lives at `/run/ddcd.sock`
+/// so any user can connect to it.  Non-root daemon instances use `$XDG_RUNTIME_DIR`.
+/// The client auto-detects: if `/run/ddcd.sock` exists it is preferred, otherwise
+/// it falls back to the XDG path (for user-session daemons on other machines).
 pub fn default_socket_path() -> std::path::PathBuf {
+    let system_path = std::path::PathBuf::from("/run/ddcd.sock");
+    let uid = unsafe { libc::getuid() };
+
+    if uid == 0 {
+        // Running as root — always use the system path.
+        return system_path;
+    }
+
+    // Non-root: prefer the system socket if the daemon is already running there.
+    if system_path.exists() {
+        return system_path;
+    }
+
+    // Fall back to the user-session socket.
     if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
         std::path::PathBuf::from(runtime_dir).join("ddcd.sock")
     } else {
-        let uid = unsafe { libc::getuid() };
         std::path::PathBuf::from(format!("/tmp/ddcd-{uid}.sock"))
     }
 }

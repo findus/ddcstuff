@@ -22,13 +22,14 @@ in {
       KERNEL=="i2c-[0-9]*", GROUP="i2c", MODE="0660"
     '';
 
-    # Run ddcd as a systemd user service that starts with the graphical session.
-    systemd.user.services.ddcd = {
+    # Run ddcd as a system service so it has root access to /dev/i2c-* without
+    # requiring users to be in the i2c group.  The socket at /run/ddcd.sock is
+    # world-writable so any local user can send brightness commands via ddcctl.
+    systemd.services.ddcd = {
       enable = true;
       description = "DDC brightness daemon";
-      partOf = [ "graphical-session.target" ];
-      wantedBy = [ "graphical-session.target" ];
-      after = [ "graphical-session.target" ];
+      wantedBy = [ "multi-user.target" ];
+      after = [ "multi-user.target" ];
 
       serviceConfig = {
         ExecStart = "${cfg.package}/bin/ddcd";
