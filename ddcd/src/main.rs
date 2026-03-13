@@ -72,17 +72,34 @@ async fn main() -> Result<()> {
         .with_context(|| format!("chmod socket {}", socket_path.display()))?;
     info!("socket: {}", socket_path.display());
 
-    // Initial monitor scan (blocking, before entering async loop)
-    let manager = {
-        let mut mgr = MonitorManager::new(Arc::clone(&config));
-        // Run the scan in a blocking thread so we don't block tokio
-        let mgr = tokio::task::spawn_blocking(move || {
-            mgr.scan();
-            mgr
-        })
-        .await?;
-        Arc::new(Mutex::new(mgr))
-    };
+    // Initial monitor scan with retries until the count stabilises.
+    // I2C buses on Thunderbolt docks may appear sequentially, so we keep scanning
+    // as long as each scan finds more monitors than the previous one.
+    let manager = Arc::new(Mutex::new(MonitorManager::new(Arc::clone(&config))));
+    {
+        let mut last_found = 0usize;
+        const MAX_STARTUP: u32 = 6;
+        for attempt in 0..MAX_STARTUP {
+            let mgr = Arc::clone(&manager);
+            let found = tokio::task::spawn_blocking(move || mgr.blocking_lock().scan()).await?;
+
+            if attempt + 1 == MAX_STARTUP { break; }
+
+            if found > last_found {
+                // Count grew — more monitors may still be appearing.
+                last_found = found;
+                info!("found {found} DDC monitor(s) at startup, rescanning in 2s to check for more...");
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            } else if found == 0 {
+                // Nothing yet — exponential backoff.
+                let delay = 1u64 << (attempt + 1).min(4);
+                info!("no DDC monitors found at startup, retrying in {delay}s (attempt {}/{MAX_STARTUP})", attempt + 1);
+                tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
+            } else {
+                break; // found > 0 and stable
+            }
+        }
+    }
 
     let fade = Arc::new(Mutex::new(FadeController::new()));
 
@@ -131,15 +148,16 @@ async fn main() -> Result<()> {
         });
     });
 
-    // Spawn rescan handler with retry-on-empty backoff.
-    // When the dock is plugged in, udev fires before I2C buses are ready.
-    // If scan() finds 0 DDC monitors, retry up to 5 times (2s, 4s, 8s, 16s, 16s).
+    // Rescan handler: retries until the DDC monitor count stabilises.
+    // Keeps scanning as long as each attempt finds more monitors than the last
+    // (handles docks that register I2C buses sequentially after plug-in).
     let manager_for_rescan = Arc::clone(&manager);
     tokio::spawn(async move {
         while let Some(reason) = rescan_rx.recv().await {
             info!("rescanning monitors (reason: {:?})", reason);
 
-            const MAX_ATTEMPTS: u32 = 5;
+            let mut last_found = 0usize;
+            const MAX_ATTEMPTS: u32 = 6;
             for attempt in 0..MAX_ATTEMPTS {
                 let mgr = Arc::clone(&manager_for_rescan);
                 let found = match tokio::task::spawn_blocking(move || mgr.blocking_lock().scan()).await {
@@ -147,14 +165,19 @@ async fn main() -> Result<()> {
                     Err(e) => { error!("rescan error: {e}"); break; }
                 };
 
-                if found > 0 || attempt + 1 == MAX_ATTEMPTS {
-                    break;
-                }
+                if attempt + 1 == MAX_ATTEMPTS { break; }
 
-                // I2C buses not ready yet — wait and retry with exponential backoff.
-                let delay_secs = 1u64 << (attempt + 1).min(4); // 2, 4, 8, 16, 16...
-                info!("no DDC monitors found, retrying in {delay_secs}s (attempt {}/{MAX_ATTEMPTS})", attempt + 1);
-                tokio::time::sleep(tokio::time::Duration::from_secs(delay_secs)).await;
+                if found > last_found {
+                    last_found = found;
+                    info!("found {found} DDC monitor(s), rescanning in 2s to check for more...");
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                } else if found == 0 {
+                    let delay = 1u64 << (attempt + 1).min(4);
+                    info!("no DDC monitors found, retrying in {delay}s (attempt {}/{MAX_ATTEMPTS})", attempt + 1);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
+                } else {
+                    break; // found > 0 and stable
+                }
             }
         }
     });
