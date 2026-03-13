@@ -72,56 +72,16 @@ async fn main() -> Result<()> {
         .with_context(|| format!("chmod socket {}", socket_path.display()))?;
     info!("socket: {}", socket_path.display());
 
-    // Initial monitor scan with retries until the count stabilises.
-    // I2C buses on Thunderbolt docks may appear sequentially, so we keep scanning
-    // as long as each scan finds more monitors than the previous one.
+    // Manager starts empty — the initial scan runs in the background so the server
+    // is immediately available (backlight control works as soon as the first scan
+    // finishes, without waiting for DDC retries to complete).
     let manager = Arc::new(Mutex::new(MonitorManager::new(Arc::clone(&config))));
-    {
-        let mut last_found = 0usize;
-        const MAX_STARTUP: u32 = 6;
-        for attempt in 0..MAX_STARTUP {
-            let mgr = Arc::clone(&manager);
-            let found = tokio::task::spawn_blocking(move || mgr.blocking_lock().scan()).await?;
-
-            if attempt + 1 == MAX_STARTUP { break; }
-
-            if found > last_found {
-                // Count grew — more monitors may still be appearing.
-                last_found = found;
-                info!("found {found} DDC monitor(s) at startup, rescanning in 2s to check for more...");
-                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-            } else if found == 0 {
-                // Nothing yet — exponential backoff.
-                let delay = 1u64 << (attempt + 1).min(4);
-                info!("no DDC monitors found at startup, retrying in {delay}s (attempt {}/{MAX_STARTUP})", attempt + 1);
-                tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
-            } else {
-                break; // found > 0 and stable
-            }
-        }
-    }
 
     let fade = Arc::new(Mutex::new(FadeController::new()));
 
-    // Watch channel for coalesced "set all monitors" brightness.
-    // Each SetBrightness{All} request just updates this value; a single applier
-    // task drains it as fast as DDC allows. Rapid scroll events are coalesced so
-    // only the latest pending value is written — no queue buildup.
-    let initial_brightness = {
-        let mgr = manager.lock().await;
-        let ids = mgr.all_ids();
-        if ids.is_empty() {
-            50u8
-        } else {
-            let sum: u32 = mgr
-                .list_monitors()
-                .iter()
-                .map(|m| m.brightness_percent as u32)
-                .sum();
-            (sum / ids.len() as u32).clamp(1, 100) as u8
-        }
-    };
-    let (desired_tx, desired_rx) = watch::channel(initial_brightness);
+    // Watch channel for coalesced "set all monitors" brightness (starts at 50;
+    // updated to the actual value after the first scan completes).
+    let (desired_tx, desired_rx) = watch::channel(50u8);
     let desired_tx = Arc::new(desired_tx);
 
     // Applier: always writes the latest desired brightness; never queues stale values.
@@ -182,7 +142,8 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Spawn Unix socket server
+    // Spawn Unix socket server — starts before the initial scan so backlight
+    // commands are accepted immediately (DDC retries happen in background).
     let server_manager = Arc::clone(&manager);
     let server_fade = Arc::clone(&fade);
     let server_config = Arc::clone(&config);
@@ -192,6 +153,9 @@ async fn main() -> Result<()> {
             error!("server error: {e}");
         }
     });
+
+    // Trigger initial scan through the same retry loop used for hotplug rescans.
+    let _ = rescan_tx.send(RescanReason::Startup).await;
 
     // Wait for SIGTERM or SIGINT
     tokio::select! {
